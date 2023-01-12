@@ -18,15 +18,19 @@
 package kms
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/secure-io/sio-go/sioutil"
@@ -35,6 +39,7 @@ import (
 
 	"github.com/minio/kes"
 	"github.com/minio/minio/internal/hash/sha256"
+	"github.com/minio/sio"
 )
 
 // Parse parses s as single-key KMS. The given string
@@ -55,26 +60,28 @@ func Parse(s string) (KMS, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(keyID, key)
+	return New(keyID, key, false)
 }
 
 // New returns a single-key KMS that derives new DEKs from the
 // given key.
-func New(keyID string, key []byte) (KMS, error) {
+func New(keyID string, key []byte, legacy bool) (KMS, error) {
 	if len(key) != 32 {
 		return nil, errors.New("kms: invalid key length " + strconv.Itoa(len(key)))
 	}
 	return secretKey{
-		keyID: keyID,
-		key:   key,
+		keyID:  keyID,
+		key:    key,
+		legacy: legacy,
 	}, nil
 }
 
 // secretKey is a KMS implementation that derives new DEKs
 // from a single key.
 type secretKey struct {
-	keyID string
-	key   []byte
+	keyID  string
+	key    []byte
+	legacy bool //< Should encrypt using legacy mode also?
 }
 
 var _ KMS = secretKey{} // compiler check
@@ -99,12 +106,39 @@ func (secretKey) CreateKey(context.Context, string) error {
 	return errors.New("kms: creating keys is not supported")
 }
 
+func (kms *secretKey) legacyGenerateKey(keyID string, ctx Context) (DEK, error) {
+	if keyID == "" {
+		keyID = kms.keyID
+	}
+
+	var key [32]byte
+	if _, err := io.ReadFull(rand.Reader, key[:]); err != nil {
+		return DEK{}, errors.New("Unable to read enough randomness from the system")
+	}
+
+	var (
+		buffer     bytes.Buffer
+		derivedKey = kms.deriveKey(keyID, ctx)
+	)
+	if n, err := sio.Encrypt(&buffer, bytes.NewReader(key[:]), sio.Config{Key: derivedKey[:]}); err != nil || n != 64 {
+		return DEK{}, errors.New("KMS: unable to encrypt data key")
+	}
+	return DEK{
+		KeyID:      kms.keyID,
+		Plaintext:  key[:],
+		Ciphertext: buffer.Bytes(),
+	}, nil
+}
+
 func (kms secretKey) GenerateKey(_ context.Context, keyID string, context Context) (DEK, error) {
 	if keyID == "" {
 		keyID = kms.keyID
 	}
 	if keyID != kms.keyID {
 		return DEK{}, fmt.Errorf("kms: key %q does not exist", keyID)
+	}
+	if kms.legacy {
+		return kms.legacyGenerateKey(keyID, context)
 	}
 	iv, err := sioutil.Random(16)
 	if err != nil {
@@ -177,9 +211,37 @@ func (kms secretKey) GenerateKey(_ context.Context, keyID string, context Contex
 	}, nil
 }
 
+func (kms secretKey) deriveKey(keyID string, context Context) (key [32]byte) {
+	if context == nil {
+		context = Context{}
+	}
+	ctxBytes, _ := context.MarshalText()
+
+	mac := hmac.New(sha256.New, kms.key[:])
+	mac.Write([]byte(keyID))
+	mac.Write(ctxBytes)
+	mac.Sum(key[:0])
+	return key
+}
+
+func (kms secretKey) legacyDecryptKey(keyID string, sealedKey []byte, ctx Context) ([]byte, error) {
+	var derivedKey = kms.deriveKey(keyID, ctx)
+
+	var key [32]byte
+	out, err := sio.DecryptBuffer(key[:0], sealedKey, sio.Config{Key: derivedKey[:]})
+	if err != nil || len(out) != 32 {
+		return nil, err // TODO(aead): upgrade sio to use sio.Error
+	}
+	return key[:], nil
+}
+
 func (kms secretKey) DecryptKey(keyID string, ciphertext []byte, context Context) ([]byte, error) {
 	if keyID != kms.keyID {
 		return nil, fmt.Errorf("kms: key %q does not exist", keyID)
+	}
+
+	if !utf8.Valid(ciphertext) {
+		return kms.legacyDecryptKey(keyID, ciphertext, context)
 	}
 
 	var encryptedKey encryptedKey

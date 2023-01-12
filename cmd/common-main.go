@@ -24,6 +24,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -785,6 +786,10 @@ func handleKMSConfig() {
 	switch {
 	case env.IsSet(config.EnvKMSSecretKey) && env.IsSet(config.EnvKESEndpoint):
 		logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", config.EnvKMSSecretKey, config.EnvKESEndpoint))
+	case env.IsSet(config.EnvKMSMasterKey) && env.IsSet(config.EnvKESEndpoint):
+		logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", config.EnvKMSMasterKey, config.EnvKESEndpoint))
+	case env.IsSet(config.EnvKMSMasterKey) && env.IsSet(config.EnvKMSSecretKey):
+		logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", config.EnvKMSMasterKey, config.EnvKMSSecretKey))
 	}
 
 	if env.IsSet(config.EnvKMSSecretKey) {
@@ -793,6 +798,31 @@ func handleKMSConfig() {
 			logger.Fatal(err, "Unable to parse the KMS secret key inherited from the shell environment")
 		}
 		GlobalKMS = KMS
+	} else if env.IsSet(config.EnvKMSMasterKey) {
+		// XXX: Backwards compatibility with old MINIO_KMS_MASTER_KEY..
+		logger.LogIf(GlobalContext, fmt.Errorf("legacy KMS configuration, this environment variable %q is deprecated.", config.EnvKMSMasterKey))
+		v := strings.SplitN(env.Get(config.EnvKMSMasterKey, ""), ":", 2)
+		if len(v) != 2 {
+			logger.Fatal(errors.New("invalid "+config.EnvKMSMasterKey), "Unable to parse the KMS secret key inherited from the shell environment")
+		}
+		secretKey, err := hex.DecodeString(v[1])
+		if err != nil {
+			logger.Fatal(err, "Unable to parse the KMS secret key inherited from the shell environment")
+		}
+		legacy := true
+		switch env.Get(config.EnvKMSMasterKeyMode, "") {
+		case "legacy":
+			legacy = true
+		case "forward":
+			legacy = false
+		case "": //< do nothing..
+		default:
+			logger.Fatal(errors.New("invalid KMS configuration"), fmt.Sprintf("The environment contains %q with an unknown value", config.EnvKMSMasterKeyMode))
+		}
+		GlobalKMS, err = kms.New(v[0], secretKey, legacy)
+		if err != nil {
+			logger.Fatal(err, "Unable to parse the KMS secret key inherited from the shell environment")
+		}
 	}
 	if env.IsSet(config.EnvKESEndpoint) {
 		var endpoints []string
